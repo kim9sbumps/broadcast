@@ -45,6 +45,8 @@
     const db = getDatabase(app);
 
     let peerConnection = null;
+    const hostCandidateQueue = [];
+
     const rtcConfig = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -62,7 +64,7 @@
       try {
         const offerSnap = await get(ref(db, 'stream_session/offer'));
         if (!offerSnap.exists()) {
-          alert('아직 시작된 방송이 없습니다. 호스트가 먼저 화면 공유를 시작해야 합니다.');
+          alert('아직 시작된 방송이 없습니다. 호스트가 화면 공유를 시작할 때까지 기다려 주세요.');
           status.innerText = "호스트 연결 대기 중...";
           return;
         }
@@ -71,8 +73,11 @@
         peerConnection = new RTCPeerConnection(rtcConfig);
 
         peerConnection.ontrack = (event) => {
-          remoteVideo.srcObject = event.streams[0];
-          overlay.style.display = 'none';
+          if (event.streams && event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+            remoteVideo.play().catch(e => console.log("자동재생 대기:", e));
+            overlay.style.display = 'none';
+          }
         };
 
         peerConnection.onicecandidate = (event) => {
@@ -90,22 +95,36 @@
           sdp: answer.sdp
         });
 
+        // 큐에 있는 호스트 Candidate 비우기
+        while (hostCandidateQueue.length > 0) {
+          const cand = hostCandidateQueue.shift();
+          try {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+          } catch (e) {
+            console.error("Host Candidate 추가 실패:", e);
+          }
+        }
+
         onChildAdded(ref(db, 'stream_session/hostCandidates'), async (snapshot) => {
           const cand = snapshot.val();
-          if (cand && peerConnection) {
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
-            } catch (e) {
-              console.error("Host Candidate 수신 오류:", e);
+          if (cand) {
+            if (peerConnection.currentRemoteDescription) {
+              try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+              } catch (e) {
+                console.error("Host Candidate 수신 오류:", e);
+              }
+            } else {
+              hostCandidateQueue.push(cand);
             }
           }
         });
 
-        status.innerText = "스트림 수신 중...";
+        status.innerText = "화면 수신 중...";
 
       } catch (err) {
         console.error("시청 연결 실패:", err);
-        status.innerText = "연결 중 오류가 발생했습니다. (F5 새로고침 후 재시도)";
+        status.innerText = "연결 중 오류가 발생했습니다.";
       }
     };
   </script>
