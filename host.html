@@ -9,10 +9,11 @@
     body { background: #121212; color: #eee; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; gap: 16px; }
     .video-box { width: 80vw; max-width: 960px; aspect-ratio: 16/9; background: #000; border-radius: 8px; overflow: hidden; border: 1px solid #333; }
     video { width: 100%; height: 100%; object-fit: contain; }
-    .controls { display: flex; gap: 12px; align-items: center; }
-    button { padding: 10px 20px; font-size: 15px; font-weight: bold; background: #2e7d32; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .controls { display: flex; gap: 12px; align-items: center; flex-direction: column; }
+    button { padding: 12px 24px; font-size: 15px; font-weight: bold; background: #2e7d32; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
     button:disabled { background: #555; cursor: not-allowed; }
-    #status { font-size: 14px; color: #aaa; }
+    #status { font-size: 14px; color: #aaa; text-align: center; max-width: 600px; line-height: 1.5; }
+    .err-text { color: #ff6b6b !important; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -25,12 +26,12 @@
 
   <div class="controls">
     <button id="startBtn" onclick="startStream()">화면 및 소리 공유 시작</button>
-    <span id="status">대기 중...</span>
+    <div id="status">대기 중...</div>
   </div>
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-app.js";
-    import { getDatabase, ref, set, push, onChildAdded, remove } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
+    import { getDatabase, ref, set, push, onChildAdded, remove, onValue } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyD4gexCqmXXR0BoWWIl3j84De-NrX7msYA",
@@ -42,12 +43,14 @@
       appId: "1:500229195135:web:cdb336f8acdcbe662b064a"
     };
 
+
     const app = initializeApp(firebaseConfig);
     const db = getDatabase(app);
     const sessionRef = ref(db, 'stream_session');
 
     let localStream = null;
     let peerConnection = null;
+    const clientCandidateQueue = [];
 
     const rtcConfig = {
       iceServers: [
@@ -59,37 +62,29 @@
     window.startStream = async function() {
       const startBtn = document.getElementById('startBtn');
       const status = document.getElementById('status');
+      status.className = "";
 
       try {
-        // 1. 화면 및 오디오 캡처 (오디오 실패 시 비디오 단독 캡처로 자동 폴백)
-        try {
-          localStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: 60, max: 60 } },
-            audio: true
-          });
-        } catch (mediaErr) {
-          console.warn("오디오 포함 캡처 실패, 비디오만 재시도:", mediaErr);
-          localStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { frameRate: { ideal: 60, max: 60 } },
-            audio: false
-          });
-        }
+        status.innerText = "1단계: 화면 공유 선택 중...";
+        
+        localStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true
+        });
 
         document.getElementById('localVideo').srcObject = localStream;
         startBtn.disabled = true;
-        status.innerText = "연결 방 생성 중...";
 
-        // 이전 세션 DB 완전 초기화
+        status.innerText = "2단계: 이전 세션 초기화 중...";
         await remove(sessionRef);
 
-        // 2. PeerConnection 생성 및 트랙 추가
+        status.innerText = "3단계: P2P 연결 생성 중...";
         peerConnection = new RTCPeerConnection(rtcConfig);
 
         localStream.getTracks().forEach(track => {
           peerConnection.addTrack(track, localStream);
         });
 
-        // ICE Candidate 전송
         peerConnection.onicecandidate = (event) => {
           if (event.candidate) {
             push(ref(db, 'stream_session/hostCandidates'), event.candidate.toJSON());
@@ -97,10 +92,13 @@
         };
 
         peerConnection.onconnectionstatechange = () => {
-          status.innerText = `연결 상태: ${peerConnection.connectionState}`;
+          if (peerConnection.connectionState === 'connected') {
+            status.innerText = "🎉 친구와 연결되었습니다! (실시간 송출 중)";
+          } else if (peerConnection.connectionState === 'disconnected') {
+            status.innerText = "연결이 끊어졌습니다.";
+          }
         };
 
-        // 3. Offer 생성 및 저장
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
 
@@ -109,43 +107,51 @@
           sdp: offer.sdp
         });
 
-        status.innerText = "친구의 접속을 기다리는 중...";
+        status.innerText = "✅ 준비 완료! 친구에게 index.html 링크를 주고 클릭하게 하세요.";
 
-        // 4. Client Answer 수신 대기
-        const answerRef = ref(db, 'stream_session/answer');
-        const checkAnswerInterval = setInterval(async () => {
-          if (peerConnection.currentRemoteDescription) return;
-          
-          const { get } = await import("https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js");
-          const snap = await get(answerRef);
-          if (snap.exists() && !peerConnection.currentRemoteDescription) {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(snap.val()));
-            status.innerText = "친구와 연결되었습니다! (송출 중)";
-            clearInterval(checkAnswerInterval);
-          }
-        }, 1000);
-
-        // 5. Client ICE Candidates 실시간 반영
-        onChildAdded(ref(db, 'stream_session/clientCandidates'), async (snapshot) => {
-          const cand = snapshot.val();
-          if (cand && peerConnection) {
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
-            } catch (e) {
-              console.error("Client Candidate 추가 오류:", e);
+        // Answer 감지
+        onValue(ref(db, 'stream_session/answer'), async (snapshot) => {
+          const answer = snapshot.val();
+          if (answer && !peerConnection.currentRemoteDescription) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+            
+            // 큐에 쌓여 있던 Candidate 일괄 처리
+            while (clientCandidateQueue.length > 0) {
+              const candidate = clientCandidateQueue.shift();
+              try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+              } catch (e) {
+                console.error("Queue Candidate 추가 실패:", e);
+              }
             }
           }
         });
 
-        // 사용자가 화면 공유 창을 닫았을 때
+        // Client Candidate 수신 처리
+        onChildAdded(ref(db, 'stream_session/clientCandidates'), async (snapshot) => {
+          const cand = snapshot.val();
+          if (cand) {
+            if (peerConnection.currentRemoteDescription) {
+              try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+              } catch (e) {
+                console.error("Candidate 추가 실패:", e);
+              }
+            } else {
+              clientCandidateQueue.push(cand);
+            }
+          }
+        });
+
         localStream.getVideoTracks()[0].onended = () => {
           remove(sessionRef);
           location.reload();
         };
 
       } catch (err) {
-        console.error("스트리밍 시작 실패:", err);
-        status.innerText = "화면 공유가 취소되었거나 브라우저 권한 오류입니다.";
+        console.error("스트리밍 오류:", err);
+        status.className = "err-text";
+        status.innerText = `[오류] ${err.name || err.message}`;
         startBtn.disabled = false;
       }
     };
