@@ -30,27 +30,24 @@
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-app.js";
-    import { getDatabase, ref, set, onValue, remove } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
+    import { getDatabase, ref, set, push, onChildAdded, remove } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
 
     const firebaseConfig = {
-      apiKey: "AIzaSyD4gexCqmXXR0BoWWIl3j84De-NrX7msYA",
-      authDomain: "paper-boat-695f8.firebaseapp.com",
-      databaseURL: "https://paper-boat-695f8-default-rtdb.asia-southeast1.firebasedatabase.app",
-      projectId: "paper-boat-695f8",
-      storageBucket: "paper-boat-695f8.firebasestorage.app",
-      messagingSenderId: "500229195135",
-      appId: "1:500229195135:web:cdb336f8acdcbe662b064a"
+      // 본인의 Firebase 정보
     };
 
     const app = initializeApp(firebaseConfig);
     const db = getDatabase(app);
-    const roomRef = ref(db, 'stream_session');
+    const sessionRef = ref(db, 'stream_session');
 
     let localStream = null;
     let peerConnection = null;
 
     const rtcConfig = {
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
     };
 
     window.startStream = async function() {
@@ -58,31 +55,38 @@
       const status = document.getElementById('status');
 
       try {
-        localStream = await navigator.mediaDevices.getDisplayMedia({
-          video: {
-            cursor: "always",
-            frameRate: { ideal: 60, max: 60 },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 }
-          },
-          audio: true
-        });
+        // 1. 화면 및 오디오 캡처 (오디오 실패 시 비디오 단독 캡처로 자동 폴백)
+        try {
+          localStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 60, max: 60 } },
+            audio: true
+          });
+        } catch (mediaErr) {
+          console.warn("오디오 포함 캡처 실패, 비디오만 재시도:", mediaErr);
+          localStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { frameRate: { ideal: 60, max: 60 } },
+            audio: false
+          });
+        }
 
         document.getElementById('localVideo').srcObject = localStream;
         startBtn.disabled = true;
-        status.innerText = "연결 준비 중...";
+        status.innerText = "연결 방 생성 중...";
 
-        await remove(roomRef);
+        // 이전 세션 DB 완전 초기화
+        await remove(sessionRef);
 
+        // 2. PeerConnection 생성 및 트랙 추가
         peerConnection = new RTCPeerConnection(rtcConfig);
 
         localStream.getTracks().forEach(track => {
           peerConnection.addTrack(track, localStream);
         });
 
+        // ICE Candidate 전송
         peerConnection.onicecandidate = (event) => {
           if (event.candidate) {
-            set(ref(db, `stream_session/hostCandidates/${Date.now()}`), event.candidate.toJSON());
+            push(ref(db, 'stream_session/hostCandidates'), event.candidate.toJSON());
           }
         };
 
@@ -90,6 +94,7 @@
           status.innerText = `연결 상태: ${peerConnection.connectionState}`;
         };
 
+        // 3. Offer 생성 및 저장
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
 
@@ -100,35 +105,41 @@
 
         status.innerText = "친구의 접속을 기다리는 중...";
 
-        onValue(ref(db, 'stream_session/answer'), async (snapshot) => {
-          const answer = snapshot.val();
-          if (answer && !peerConnection.currentRemoteDescription) {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+        // 4. Client Answer 수신 대기
+        const answerRef = ref(db, 'stream_session/answer');
+        const checkAnswerInterval = setInterval(async () => {
+          if (peerConnection.currentRemoteDescription) return;
+          
+          const { get } = await import("https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js");
+          const snap = await get(answerRef);
+          if (snap.exists() && !peerConnection.currentRemoteDescription) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(snap.val()));
             status.innerText = "친구와 연결되었습니다! (송출 중)";
+            clearInterval(checkAnswerInterval);
+          }
+        }, 1000);
+
+        // 5. Client ICE Candidates 실시간 반영
+        onChildAdded(ref(db, 'stream_session/clientCandidates'), async (snapshot) => {
+          const cand = snapshot.val();
+          if (cand && peerConnection) {
+            try {
+              await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+            } catch (e) {
+              console.error("Client Candidate 추가 오류:", e);
+            }
           }
         });
 
-        onValue(ref(db, 'stream_session/clientCandidates'), (snapshot) => {
-          const candidates = snapshot.val();
-          if (candidates) {
-            Object.values(candidates).forEach(async (cand) => {
-              try {
-                await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
-              } catch (e) {
-                console.error("Candidate 추가 오류:", e);
-              }
-            });
-          }
-        });
-
+        // 사용자가 화면 공유 창을 닫았을 때
         localStream.getVideoTracks()[0].onended = () => {
-          remove(roomRef);
+          remove(sessionRef);
           location.reload();
         };
 
       } catch (err) {
         console.error("스트리밍 시작 실패:", err);
-        status.innerText = "화면 공유가 취소되었거나 오류가 발생했습니다.";
+        status.innerText = "화면 공유가 취소되었거나 브라우저 권한 오류입니다.";
         startBtn.disabled = false;
       }
     };
