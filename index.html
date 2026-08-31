@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>화면 시청 (Viewer)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; width: 100vw; height: 100vh; }
+    video { width: 100vw; height: 100vh; object-fit: contain; }
+    #overlay {
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.85); color: #fff;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      font-family: sans-serif; gap: 14px; cursor: pointer; z-index: 10;
+    }
+    #overlay h2 { font-size: 22px; font-weight: normal; }
+    #overlay p { font-size: 14px; color: #aaa; }
+  </style>
+</head>
+<body>
+
+  <div id="overlay" onclick="connectStream()">
+    <h2>📺 방송을 시청하려면 화면을 클릭하세요</h2>
+    <p id="status">호스트 연결 대기 중...</p>
+  </div>
+
+  <video id="remoteVideo" autoplay playsinline></video>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-app.js";
+    import { getDatabase, ref, get, set, onValue } from "https://www.gstatic.com/firebasejs/9.22.1/firebase-database.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyD4gexCqmXXR0BoWWIl3j84De-NrX7msYA",
+      authDomain: "paper-boat-695f8.firebaseapp.com",
+      databaseURL: "https://paper-boat-695f8-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "paper-boat-695f8",
+      storageBucket: "paper-boat-695f8.firebasestorage.app",
+      messagingSenderId: "500229195135",
+      appId: "1:500229195135:web:cdb336f8acdcbe662b064a"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    let peerConnection = null;
+    const rtcConfig = {
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    };
+
+    window.connectStream = async function() {
+      const status = document.getElementById('status');
+      const overlay = document.getElementById('overlay');
+      const remoteVideo = document.getElementById('remoteVideo');
+
+      status.innerText = "호스트 신호 찾는 중...";
+
+      try {
+        const offerSnap = await get(ref(db, 'stream_session/offer'));
+        if (!offerSnap.exists()) {
+          alert('아직 시작된 방송이 없습니다. 호스트가 방송을 켤 때까지 기다려 주세요.');
+          status.innerText = "호스트 연결 대기 중...";
+          return;
+        }
+
+        const offer = offerSnap.val();
+        peerConnection = new RTCPeerConnection(rtcConfig);
+
+        peerConnection.ontrack = (event) => {
+          remoteVideo.srcObject = event.streams[0];
+          overlay.style.display = 'none';
+        };
+
+        peerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            set(ref(db, `stream_session/clientCandidates/${Date.now()}`), event.candidate.toJSON());
+          }
+        };
+
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        await set(ref(db, 'stream_session/answer'), {
+          type: answer.type,
+          sdp: answer.sdp
+        });
+
+        onValue(ref(db, 'stream_session/hostCandidates'), (snapshot) => {
+          const candidates = snapshot.val();
+          if (candidates) {
+            Object.values(candidates).forEach(async (cand) => {
+              try {
+                await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+              } catch (e) {
+                console.error("Candidate 수신 오류:", e);
+              }
+            });
+          }
+        });
+
+      } catch (err) {
+        console.error("시청 연결 실패:", err);
+        status.innerText = "연결 중 오류가 발생했습니다.";
+      }
+    };
+  </script>
+</body>
+</html>
